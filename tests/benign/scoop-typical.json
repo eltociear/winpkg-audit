@@ -1,0 +1,20 @@
+{
+    "version": "24.08",
+    "description": "A file archiver",
+    "homepage": "https://example.org",
+    "license": "LGPL-2.1-or-later",
+    "architecture": {
+        "64bit": {"url": "https://example.org/a-x64.msi", "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "extract_dir": "Files\\App"},
+        "32bit": {"url": "https://example.org/a.msi", "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "extract_dir": "Files\\App"}
+    },
+    "post_install": [
+        "$reg = \"$dir\\install-context.reg\"",
+        "if (Test-Path $reg) { $content = (Get-Content $reg).Replace('$dir', $dir.Replace('\\', '\\\\')); Set-Content \"$dir\\install-context.reg\" $content -Encoding Ascii }",
+        "Write-Host 'Run reg import \"$dir\\install-context.reg\" to add context menu entries' -ForegroundColor Yellow"
+    ],
+    "uninstaller": {"script": ["if ($cmd -eq 'uninstall') { reg import \"$dir\\uninstall-context.reg\" }", "Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'App' -ErrorAction SilentlyContinue"]},
+    "bin": "app.exe",
+    "shortcuts": [["appFM.exe", "App File Manager"]],
+    "checkver": {"url": "https://example.org/download.html", "regex": "Download App ([\\d.]+)"},
+    "autoupdate": {"architecture": {"64bit": {"url": "https://example.org/a$cleanVersion-x64.msi"}}}
+}

