@@ -626,8 +626,12 @@ def choco_units(files):
 # Scanner
 # ---------------------------------------------------------------------------
 def _item(sev, pg, loc, matched, line, ctx):
-    return {"severity": sev.upper(), "id": pg["id"], "name": pg["name"], "description": pg["desc"],
-            "line": loc, "context_block": ctx, "matched": matched[:120], "context": line.strip()[:200]}
+    it = {"severity": sev.upper(), "id": pg["id"], "name": pg["name"], "description": pg["desc"],
+          "line": loc, "context_block": ctx, "matched": matched[:120], "context": line.strip()[:200]}
+    m = re.match(r"(.+\.psm?1):L\d+$", str(loc), re.I)   # Chocolatey package script ("tools/x.ps1:L3")
+    if m:
+        it["file"] = m.group(1)
+    return it
 
 
 def scan_units(units, downloads, kind):
@@ -1049,6 +1053,10 @@ def _fam_uri(target, file):
     t = target or ""
     if t and os.path.isdir(t):
         p = os.path.normpath(os.path.join(t, file)) if file else os.path.normpath(t)
+        parts = file.split("/")
+        for k in range(1, len(parts)):   # scanner-side prefixes (e.g. custom_components/<d>/) not on disk
+            if not os.path.exists(p) and os.path.exists(os.path.join(t, *parts[k:])):
+                p = os.path.normpath(os.path.join(t, *parts[k:]))
     elif t and os.path.isfile(t) and (not file or file == t or file == os.path.basename(t)):
         p = os.path.normpath(t)
     elif t and os.path.isfile(t):
