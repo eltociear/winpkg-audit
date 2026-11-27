@@ -24,15 +24,18 @@ Usage:
   python3 winpkg_audit.py --winget Publisher.App     # latest manifest from microsoft/winget-pkgs
   python3 winpkg_audit.py --choco id[@version]       # a package from community.chocolatey.org
   python3 winpkg_audit.py --text "<powershell>"      # scan a snippet as an install hook
-  add --json for machine-readable output, --all to also list SAFE targets, --verbose for INFO
-  exit code 2 if any target is HIGH or CRITICAL (CI-friendly)
+  add --json (family schema) or --sarif (SARIF 2.1.0) for machine-readable output,
+  --all to also list SAFE targets, --verbose for INFO, --fail-on {critical,high,medium,low,never}
+  exit code 2 if any target reaches --fail-on (default HIGH; CI-friendly), 1 on usage errors
 
 MIT licensed. https://github.com/eltociear/winpkg-audit
 """
+import hashlib
 import io
 import json
 import os
 import re
+import stat
 import sys
 import tarfile
 import time
@@ -40,7 +43,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
+MAX_READ = 4000000   # bytes read per manifest / script
 UA = {"User-Agent": "winpkg-audit/%s (github.com/eltociear/winpkg-audit)" % __version__}
 
 # Contexts:
@@ -379,10 +383,35 @@ TRUSTED_HOST = re.compile(
     r"(?:^|\.)(?:github\.com|githubusercontent\.com|chocolatey\.org|microsoft\.com|windows\.net|"
     r"visualstudio\.com|nuget\.org|scoop\.sh|localhost)$", re.I)
 
-DL_ASSIGN = re.compile(
-    r"(?:\$(?P<var>\w+)\s*=\s*)?[^\n]*?(?:Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^\n]*-(?:OutFile|o)\s+(?P<out>\S+)"
-    r"|\.DownloadFile\s*\(\s*[^,]+,\s*(?P<out2>[^)]+)\)"
+# Anchored on the download keyword: the old leading `(?:$var=)?[^\n]*?` made every unanchored
+# search O(n^2) per line (a 40 kB one-line script took ~40 s, 5 MB never finished).
+_DL_CMD = re.compile(
+    r"(?:Invoke-WebRequest|iwr|Invoke-RestMethod|irm)\b[^\n]*-(?:OutFile|o)\s+(?P<out>\S+)"
+    r"|\.DownloadFile\s*\(\s*[^,)\n]{1,2000},\s*(?P<out2>[^)\n]{1,2000})\)"
     r"|\bStart-BitsTransfer\b[^\n]*-Destination\s+(?P<out3>\S+)", re.I)
+_DL_VAR = re.compile(r"\$(\w+)\s*=\s*")
+
+
+class _DlMatch:
+    def __init__(self, m, var):
+        self.m, self.var = m, var
+
+    def group(self, name):
+        return self.var if name == "var" else self.m.group(name)
+
+
+class _DlAssign:
+    """Same groups as the old single regex: var is only captured from a `$x =` at the line start."""
+
+    def search(self, line):
+        m = _DL_CMD.search(line)
+        if not m:
+            return None
+        v = _DL_VAR.match(line)
+        return _DlMatch(m, v.group(1) if v and v.end() <= m.start() else None)
+
+
+DL_ASSIGN = _DlAssign()
 # prefix that makes the following token the *command* (not an argument such as `7z x <file>`)
 RUN_AS_CMD = (r"(?:\bStart-Process\s+(?:-FilePath\s+)?|(?:^|[;{(|]|&&)\s*&\s*|\bInvoke-Item\s+|"
               r"\bmsiexec(?:\.exe)?\b[^\n]*?/[ia]\s*|\bcmd(?:\.exe)?\s+/[ck]\s+(?:call\s+)?|-File(?:Path)?\s+|"
@@ -431,6 +460,16 @@ def _strip_ps_comments(text):
     return out
 
 
+LONG_LINE = 4000   # longer (minified / padded) lines are scanned in overlapping windows
+SEG, SEG_OVERLAP = 4000, 600
+
+
+def _windows(line):
+    if len(line) <= LONG_LINE:
+        return [line]
+    return [line[i:i + SEG] for i in range(0, len(line), SEG - SEG_OVERLAP)]
+
+
 def ps_units(text, ctx, prefix=""):
     units = []
     for i, line in enumerate(_strip_ps_comments(text)):
@@ -439,7 +478,8 @@ def ps_units(text, ctx, prefix=""):
         c = ctx
         if ctx == "hook" and MSG_LINE.match(line):
             c = "message"
-        units.append((c, "%sL%d" % (prefix, i + 1), line))
+        for seg in _windows(line):
+            units.append((c, "%sL%d" % (prefix, i + 1), seg))
     return units
 
 
@@ -760,13 +800,15 @@ def _fetch(url, binary=False, tries=3):
 
 
 def _nupkg_files(blob):
-    out = []
+    out, budget = [], ArchiveBudget()
     try:
         with zipfile.ZipFile(io.BytesIO(blob)) as z:
-            for n in z.namelist():
-                if n.lower().endswith((".ps1", ".psm1")) and z.getinfo(n).file_size < 4_000_000:
-                    out.append((n, z.read(n).decode("utf-8-sig", "replace")))
-    except zipfile.BadZipFile:
+            for zi in z.infolist():
+                n = safe_member(zi.filename)
+                if (n and not zi.is_dir() and n.lower().endswith((".ps1", ".psm1")) and zi.file_size < 4_000_000
+                        and budget.take(zi.file_size)):
+                    out.append((n, z.read(zi).decode("utf-8-sig", "replace")))
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, NotImplementedError, EOFError, ValueError, OSError):
         pass
     return out
 
@@ -796,11 +838,13 @@ def from_scoop_bucket(repo):
     out = []
     if not blob:
         return out
+    budget = ArchiveBudget()
     with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
-        for m in tf.getmembers():
-            if not m.isfile() or not m.name.endswith(".json"):
+        for m in tf:
+            name = safe_member(m.name)
+            if not m.isreg() or not name or not name.endswith(".json") or not budget.take(min(m.size, MAX_READ)):
                 continue
-            rel = m.name.split("/", 1)[1] if "/" in m.name else m.name
+            rel = name.split("/", 1)[1] if "/" in name else name
             parts = rel.split("/")
             if not ((len(parts) == 2 and parts[0].lower() == "bucket") or len(parts) == 1):
                 continue
@@ -808,7 +852,7 @@ def from_scoop_bucket(repo):
                 continue
             f = tf.extractfile(m)
             if f:
-                out.append(("%s/%s" % (repo, rel), f.read().decode("utf-8-sig", "replace")))
+                out.append(("%s/%s" % (repo, rel), f.read(MAX_READ).decode("utf-8-sig", "replace")))
     return out
 
 
@@ -851,19 +895,28 @@ def from_winget(pid):
 
 
 def _read(p):
-    return open(p, encoding="utf-8-sig", errors="replace").read()
+    with open(p, "rb") as fh:
+        return fh.read(MAX_READ).decode("utf-8-sig", "replace")
+
+
+def _read_blob(p, cap=200000000):
+    with open(p, "rb") as fh:
+        return fh.read(cap)
 
 
 def from_path(p):
     if p == "-":
-        return [("<stdin>", sys.stdin.read())]
+        return [("<stdin>", sys.stdin.read(MAX_READ))]
+    if not os.path.isdir(p) and not os.path.isfile(p):
+        raise ValueError("not a regular file: %s" % p)
     if p.lower().endswith(".nupkg"):
-        return [(p, ("choco-pkg", _nupkg_files(open(p, "rb").read())))]
+        return [(p, ("choco-pkg", _nupkg_files(_read_blob(p))))]
     if not os.path.isdir(p):
         return [(p, _read(p))]
     out = []
     for root, dirs, files in os.walk(p):
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        files = [f for f in files if regular_file(os.path.join(root, f))]
         ps = [f for f in files if f.lower().endswith((".ps1", ".psm1"))]
         if any(re.match(r"chocolatey(?:install|uninstall|beforemodify)\.ps1$", f, re.I) for f in ps):
             out.append((root, ("choco-pkg", [(os.path.join(root, f), _read(os.path.join(root, f))) for f in sorted(ps)])))
@@ -872,7 +925,7 @@ def from_path(p):
             full = os.path.join(root, f)
             low = f.lower()
             if low.endswith(".nupkg"):
-                out.append((full, ("choco-pkg", _nupkg_files(open(full, "rb").read()))))
+                out.append((full, ("choco-pkg", _nupkg_files(_read_blob(full)))))
             elif low.endswith(".json") and low not in ("package.json", "renovate.json", "tsconfig.json") and not low.startswith("."):
                 out.append((full, _read(full)))
             elif low.endswith((".yaml", ".yml")) and (".installer." in low or not (".locale." in low)):
@@ -897,17 +950,228 @@ _ICON = {"CRITICAL": "\U0001F534", "HIGH": "\U0001F7E0", "MEDIUM": "\U0001F7E1",
          "LOW": "\U0001F535", "SAFE": "\U0001F7E2"}
 
 
+# ---------------------------------------------------------------------------
+# Pipeline output shared by the eltociear/*-audit family: --json / --sarif / --fail-on
+# (this block is kept identical across the family; see "Output formats" in the README)
+# ---------------------------------------------------------------------------
+FAMILY_SCHEMA = "eltociear-audit/1"
+TOOL_NAME = "winpkg-audit"
+TOOL_URI = "https://github.com/eltociear/winpkg-audit"
+FAIL_ON_CHOICES = ("critical", "high", "medium", "low", "never")
+_FAM_RANK = {"SAFE": 0, "INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+_FAM_SARIF_LEVEL = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note", "INFO": "note"}
+_FAM_SEC_SEV = {"CRITICAL": "9.5", "HIGH": "8.0", "MEDIUM": "5.5", "LOW": "3.0", "INFO": "0.0"}
+
+
+def family_args(args):
+    """Strip the shared output flags from argv. Returns (remaining_args, opts)."""
+    opts = {"json": False, "sarif": False, "fail_on": "high"}
+    rest, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--json":
+            opts["json"] = True
+        elif a == "--sarif":
+            opts["sarif"] = True
+        elif a == "--fail-on" or a.startswith("--fail-on="):
+            if "=" in a:
+                v = a.split("=", 1)[1]
+            else:
+                v = args[i + 1] if i + 1 < len(args) else ""
+                i += 1
+            if v.lower() not in FAIL_ON_CHOICES:
+                sys.stderr.write("%s: --fail-on must be one of %s\n" % (TOOL_NAME, ", ".join(FAIL_ON_CHOICES)))
+                raise SystemExit(1)
+            opts["fail_on"] = v.lower()
+        else:
+            rest.append(a)
+        i += 1
+    return rest, opts
+
+
+def _fam_sev(s):
+    s = str(s or "").upper()
+    return s if s in _FAM_RANK else "INFO"
+
+
+def _fam_line(v):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        m = re.search(r"(\d+)\s*$", str(v or ""))
+        n = int(m.group(1)) if m else 0
+    return n if n > 0 else 0
+
+
+def family_finding(f, target):
+    out = dict(f) if isinstance(f, dict) else {"name": str(f)}
+    rid = str(out.get("id") or out.get("rule_id") or out.get("pattern") or "finding")
+    out.update({"rule_id": rid, "severity": _fam_sev(out.get("severity")),
+                "name": str(out.get("name") or rid), "description": str(out.get("description") or ""),
+                "file": str(out.get("file") or out.get("path") or ""), "line": _fam_line(out.get("line")),
+                "matched": str(out.get("matched") or ""), "context": str(out.get("context") or "")})
+    return out
+
+
+def family_result(r):
+    out = dict(r)
+    target = str(out.get("target") or "")
+    findings = [family_finding(f, target) for f in (out.get("findings") or [])]
+    info = [family_finding(f, target) for f in (out.get("info") or [])]
+    worst = max([_FAM_RANK[f["severity"]] for f in findings] + [_FAM_RANK.get(str(out.get("risk_level") or "").upper(), 0)])
+    level = next(k for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "SAFE") if _FAM_RANK[k] == worst)
+    counts = {k: sum(1 for f in findings if f["severity"] == k) for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
+    out.update({"target": target, "risk_level": level, "risk_score": int(out.get("risk_score") or 0),
+                "error": out.get("error") or None, "counts": counts, "findings": findings, "info": info})
+    return out
+
+
+def family_exit(results, fail_on="high"):
+    """0 = below the threshold, 2 = a target reached it. Default threshold HIGH (the historic behaviour)."""
+    if fail_on == "never":
+        return 0
+    worst = max([_FAM_RANK[family_result(r)["risk_level"]] for r in results] or [0])
+    return 2 if worst >= _FAM_RANK[fail_on.upper()] else 0
+
+
+def family_json(results, fail_on="high"):
+    res = [family_result(r) for r in results]
+    worst = max([_FAM_RANK[r["risk_level"]] for r in res] or [0])
+    return {"schema": FAMILY_SCHEMA, "tool": {"name": TOOL_NAME, "version": __version__},
+            "fail_on": fail_on, "exit_code": family_exit(results, fail_on),
+            "max_severity": next(k for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "SAFE") if _FAM_RANK[k] == worst),
+            "errors": sum(1 for r in res if r["error"]), "results": res}
+
+
+def _fam_uri(target, file):
+    """Repo-relative URI when the target is a local path, else the in-package path."""
+    file = (file or "").replace("\\", "/")
+    t = target or ""
+    if t and os.path.isdir(t):
+        p = os.path.normpath(os.path.join(t, file)) if file else os.path.normpath(t)
+    elif t and os.path.isfile(t) and (not file or file == t or file == os.path.basename(t)):
+        p = os.path.normpath(t)
+    elif t and os.path.isfile(t):
+        p = os.path.normpath(t).replace("\\", "/") + "/" + file  # member of a local archive
+    else:
+        p = file or t or "unknown"
+    p = p.replace("\\", "/")
+    if os.path.isabs(p):
+        try:
+            rel = os.path.relpath(p)
+        except ValueError:
+            rel = None
+        if rel is not None and not rel.startswith(".."):
+            p = rel.replace("\\", "/")
+        else:
+            return "file://" + urllib.parse.quote(p, safe="/:")
+    parts = [s for s in p.split("/") if s not in ("", ".", "..")]
+    return urllib.parse.quote("/".join(parts) or "unknown", safe="/@+,;=-._~")
+
+
+def family_sarif(results):
+    rules, index, out, notes = [], {}, [], []
+    for r in (family_result(x) for x in results):
+        if r["error"]:
+            notes.append({"level": "error", "message": {"text": "%s: %s" % (r["target"], r["error"])}})
+        for f in r["findings"]:
+            sev, rid = f["severity"], f["rule_id"]
+            if rid not in index:
+                index[rid] = len(rules)
+                rules.append({"id": rid, "name": "".join(w.capitalize() for w in re.split(r"[^A-Za-z0-9]+", rid) if w) or "Finding",
+                              "shortDescription": {"text": f["name"]},
+                              "fullDescription": {"text": f["description"] or f["name"]},
+                              "helpUri": TOOL_URI + "#readme",
+                              "defaultConfiguration": {"level": _FAM_SARIF_LEVEL[sev]},
+                              "properties": {"tags": ["security", TOOL_NAME], "security-severity": _FAM_SEC_SEV[sev]}})
+            else:
+                rule = rules[index[rid]]
+                if float(_FAM_SEC_SEV[sev]) > float(rule["properties"]["security-severity"]):
+                    rule["properties"]["security-severity"] = _FAM_SEC_SEV[sev]
+                    rule["defaultConfiguration"]["level"] = _FAM_SARIF_LEVEL[sev]
+            phys = {"artifactLocation": {"uri": _fam_uri(r["target"], f["file"])}}
+            if f["line"]:
+                phys["region"] = {"startLine": f["line"]}
+                if f["context"]:
+                    phys["region"]["snippet"] = {"text": f["context"]}
+            msg = "%s: %s%s" % (sev, f["description"] or f["name"], (" [%s]" % f["matched"]) if f["matched"] else "")
+            fp = "%s|%s|%s|%s" % (r["target"], rid, f["file"], f["matched"] or f["line"])
+            out.append({"ruleId": rid, "ruleIndex": index[rid], "level": _FAM_SARIF_LEVEL[sev],
+                        "message": {"text": msg}, "locations": [{"physicalLocation": phys}],
+                        "partialFingerprints": {"auditFinding/v1": hashlib.sha256(fp.encode("utf-8", "replace")).hexdigest()[:32]},
+                        "properties": {"severity": sev, "target": r["target"]}})
+    return {"$schema": "https://json.schemastore.org/sarif-2.1.0.json", "version": "2.1.0",
+            "runs": [{"tool": {"driver": {"name": TOOL_NAME, "version": __version__, "semanticVersion": __version__,
+                                          "informationUri": TOOL_URI, "rules": rules}},
+                      "invocations": [{"executionSuccessful": not notes, "toolExecutionNotifications": notes}],
+                      "results": out}]}
+
+
+def family_emit(results, opts):
+    """Print --json / --sarif output (if requested) and return the process exit code."""
+    if opts.get("sarif"):
+        print(json.dumps(family_sarif(results), indent=1, ensure_ascii=False))
+    elif opts.get("json"):
+        print(json.dumps(family_json(results, opts["fail_on"]), indent=1, ensure_ascii=False))
+    return family_exit(results, opts["fail_on"])
+
+
+# ---------------------------------------------------------------------------
+# Untrusted-input hygiene shared by the family (nothing is ever extracted to disk)
+# ---------------------------------------------------------------------------
+MAX_MEMBERS = 50000             # archive entries considered per target
+MAX_ARCHIVE_TOTAL = 300000000   # decompressed bytes read per archive (zip/tar bomb budget)
+
+
+def safe_member(name):
+    """Normalise an archive member name; None for traversal (../), absolute, drive or NUL paths."""
+    n = (name or "").replace("\\", "/")
+    if "\x00" in n or n.startswith("/") or re.match(r"^[A-Za-z]:", n):
+        return None
+    parts = [p for p in n.split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
+        return None
+    return "/".join(parts)
+
+
+def regular_file(path):
+    """True only for a real regular file (no symlinks, FIFOs, devices or sockets)."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+class ArchiveBudget:
+    """Caps entries and total decompressed bytes read from one archive."""
+
+    def __init__(self, total=None, members=None):
+        self.left = MAX_ARCHIVE_TOTAL if total is None else total
+        self.members = MAX_MEMBERS if members is None else members
+        self.truncated = False
+
+    def take(self, size):
+        self.members -= 1
+        if self.members < 0 or size > self.left:
+            self.truncated = True
+            return False
+        self.left -= size
+        return True
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     if not args or args[0] in ("-h", "--help"):
         print(__doc__)
         return 0
     if args[0] == "--version":
-        print("winpkg-audit", __version__)
+        print(TOOL_NAME, __version__)
         return 0
-    flags = {a for a in args if a in ("--json", "--all", "--verbose")}
+    args, fam = family_args(args)
+    quiet = fam["json"] or fam["sarif"]
+    flags = {a for a in args if a in ("--all", "--verbose")}
     args = [a for a in args if a not in flags]
-    targets, i = [], 0
+    targets, i, local = [], 0, False
     while i < len(args):
         a, nxt = args[i], (args[i + 1] if i + 1 < len(args) else "")
         if a == "--scoop-bucket":
@@ -921,14 +1185,20 @@ def main(argv=None):
         elif a == "--text":
             targets.append(("<text>", nxt)); i += 2
         elif os.path.exists(a) or a == "-":
-            targets += from_path(a); i += 1
+            local = True
+            try:
+                targets += from_path(a)
+            except (OSError, ValueError) as e:
+                print("winpkg-audit: %s" % e, file=sys.stderr)
+            i += 1
         else:
             print("winpkg-audit: %r is not a file/dir; use --scoop, --scoop-bucket, --winget or --choco" % a,
                   file=sys.stderr)
             i += 1
     if not targets:
         print("winpkg-audit: nothing to scan", file=sys.stderr)
-        return 1
+        if not local:
+            return 1
 
     results, worst = [], "SAFE"
     tally = dict.fromkeys(("CRITICAL", "HIGH", "MEDIUM", "LOW", "SAFE"), 0)
@@ -937,8 +1207,8 @@ def main(argv=None):
         tally[r["risk_level"]] += 1
         if SEVERITY_RANK[r["risk_level"]] > SEVERITY_RANK[worst]:
             worst = r["risk_level"]
-        if "--json" in flags:
-            results.append(dict(target=label, **r))
+        results.append(dict(target=label, **r))
+        if quiet:
             continue
         if r["risk_level"] == "SAFE" and "--all" not in flags and len(targets) > 1:
             continue
@@ -950,11 +1220,9 @@ def main(argv=None):
         if "--verbose" in flags:
             for f in r["info"]:
                 print("    INFO     %s (%s, %s)" % (f["name"], f["line"], f["context_block"]))
-    if "--json" in flags:
-        print(json.dumps(results if len(results) != 1 else results[0], indent=1))
-    else:
+    if not quiet:
         print("\nscanned %d: %s" % (len(targets), ", ".join("%d %s" % (v, k) for k, v in tally.items() if v)))
-    return 2 if SEVERITY_RANK[worst] >= SEVERITY_RANK["HIGH"] else 0
+    return family_emit(results, fam)
 
 
 if __name__ == "__main__":
